@@ -1,0 +1,35 @@
+server:
+  port: 8080
+  node_id: "node-1"
+
+origin:
+  url: "https://httpbin.org"
+  timeout: 30s
+  protection:
+    single_flight:
+      enabled: true
+    rate_limit:
+      enabled: false
+      rps: 100
+      burst: 50
+      timeout: 5s
+
+cache:
+  memory:
+    max_size_mb: 256
+  disk:
+    path: "./cache_data"
+    max_size_mb: 2048
+  default_ttl: 3600s
+
+ttl_rules:
+  - pattern: "image/*"
+    ttl: 86400s
+  - pattern: "text/html"
+    ttl: 300s
+  - pattern: "text/css"
+    ttl: 86400s
+  - pattern: "application/javascript"
+    ttl: 86400s
+  - pattern: "application/json"
+    ttl: 60s
