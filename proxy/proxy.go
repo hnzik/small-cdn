@@ -10,6 +10,11 @@ import (
 	"strconv"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
+
 	"small-cdn/cache"
 	"small-cdn/config"
 	"small-cdn/metrics"
@@ -53,15 +58,27 @@ func New(cfg *config.Config, c *cache.TieredCache) (*Proxy, error) {
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	ctx, span := metrics.Tracer.Start(r.Context(), r.Method+" "+r.URL.Path,
+		trace.WithSpanKind(trace.SpanKindServer),
+		trace.WithAttributes(
+			attribute.String("http.request.method", r.Method),
+			attribute.String("url.path", r.URL.Path),
+		),
+	)
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	start := time.Now()
 	key := cacheKey(r)
 
 	result := p.cache.Get(key)
 	if result.Found {
+		span.SetAttributes(attribute.String("cache.status", "HIT"), attribute.String("cache.tier", string(result.Tier)))
 		p.serveFromCache(w, r, result, start)
 		return
 	}
 
+	span.SetAttributes(attribute.String("cache.status", "MISS"))
 	p.fetchFromOrigin(w, r, key, start)
 }
 
@@ -86,32 +103,38 @@ func (p *Proxy) serveFromCache(w http.ResponseWriter, r *http.Request, result ca
 	w.WriteHeader(entry.StatusCode)
 	w.Write(entry.Body)
 
-	metrics.CacheHits.WithLabelValues(string(tier)).Inc()
-	metrics.TransferTime.WithLabelValues(string(tier)).Observe(transferTime.Seconds())
-	metrics.RequestsTotal.WithLabelValues(
-		strconv.Itoa(entry.StatusCode),
-		"HIT",
-		string(tier),
-		entry.ContentType,
-	).Inc()
+	ctx := r.Context()
+	trace.SpanFromContext(ctx).SetAttributes(attribute.Int("http.response.status_code", entry.StatusCode))
+	metrics.CacheHits.Add(ctx, 1, metric.WithAttributes(metrics.Attr("tier", string(tier))))
+	metrics.TransferTime.Record(ctx, transferTime.Seconds(), metric.WithAttributes(metrics.Attr("tier", string(tier))))
+	metrics.RequestsTotal.Add(ctx, 1, metric.WithAttributes(
+		metrics.Attr("status", strconv.Itoa(entry.StatusCode)),
+		metrics.Attr("cache_status", "HIT"),
+		metrics.Attr("cache_tier", string(tier)),
+		metrics.Attr("content_type", entry.ContentType),
+	))
 }
 
 func (p *Proxy) fetchFromOrigin(w http.ResponseWriter, r *http.Request, key string, start time.Time) {
 	waitStart := time.Now()
 	useSingleFlight := canUseSingleFlight(r)
 
-	resp, shared, err := p.protection.Do(r.Context(), key, useSingleFlight, func() (*origin.Response, error) {
-		metrics.OriginRequestsTotal.Inc()
+	ctx := r.Context()
+	resp, shared, err := p.protection.Do(ctx, key, useSingleFlight, func() (*origin.Response, error) {
+		metrics.OriginRequestsTotal.Add(ctx, 1)
 		return p.doOriginRequest(r)
 	})
 
 	if p.config.Origin.Protection.RateLimit.Enabled {
-		metrics.RateLimitWaitSeconds.Observe(time.Since(waitStart).Seconds())
+		metrics.RateLimitWaitSeconds.Record(ctx, time.Since(waitStart).Seconds())
 	}
 
 	if err != nil {
+		span := trace.SpanFromContext(ctx)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		if errors.Is(err, origin.ErrRateLimited) {
-			metrics.RateLimitRejected.Inc()
+			metrics.RateLimitRejected.Add(ctx, 1)
 			http.Error(w, "origin rate limited", http.StatusServiceUnavailable)
 			return
 		}
@@ -120,19 +143,27 @@ func (p *Proxy) fetchFromOrigin(w http.ResponseWriter, r *http.Request, key stri
 	}
 
 	if shared {
-		metrics.SingleFlightDeduped.Inc()
+		metrics.SingleFlightDeduped.Add(ctx, 1)
 	}
 
 	p.serveOriginResponse(w, r, key, start, resp, shared)
 }
 
 func (p *Proxy) doOriginRequest(r *http.Request) (*origin.Response, error) {
+	ctx, span := metrics.Tracer.Start(r.Context(), "cdn.origin.fetch",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(attribute.String("server.address", p.originURL.Host)),
+	)
+	defer span.End()
+
 	reqURL := *p.originURL
 	reqURL.Path = r.URL.Path
 	reqURL.RawQuery = r.URL.RawQuery
 
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, reqURL.String(), r.Body)
+	req, err := http.NewRequestWithContext(ctx, r.Method, reqURL.String(), r.Body)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
 
@@ -147,12 +178,21 @@ func (p *Proxy) doOriginRequest(r *http.Request) (*origin.Response, error) {
 	ttfb := time.Since(ttfbStart)
 
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
 	defer resp.Body.Close()
 
+	span.SetAttributes(
+		attribute.Int("http.status_code", resp.StatusCode),
+		attribute.Float64("origin.ttfb_seconds", ttfb.Seconds()),
+	)
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
 
@@ -198,15 +238,17 @@ func (p *Proxy) serveOriginResponse(w http.ResponseWriter, r *http.Request, key 
 	w.WriteHeader(resp.StatusCode)
 	w.Write(resp.Body)
 
-	metrics.CacheMisses.Inc()
-	metrics.OriginTTFB.Observe(resp.TTFB.Seconds())
-	metrics.TransferTime.WithLabelValues("origin").Observe(transferTime.Seconds())
-	metrics.RequestsTotal.WithLabelValues(
-		strconv.Itoa(resp.StatusCode),
-		"MISS",
-		"",
-		resp.ContentType,
-	).Inc()
+	ctx := r.Context()
+	trace.SpanFromContext(ctx).SetAttributes(attribute.Int("http.response.status_code", resp.StatusCode))
+	metrics.CacheMisses.Add(ctx, 1)
+	metrics.OriginTTFB.Record(ctx, resp.TTFB.Seconds())
+	metrics.TransferTime.Record(ctx, transferTime.Seconds(), metric.WithAttributes(metrics.Attr("tier", "origin")))
+	metrics.RequestsTotal.Add(ctx, 1, metric.WithAttributes(
+		metrics.Attr("status", strconv.Itoa(resp.StatusCode)),
+		metrics.Attr("cache_status", "MISS"),
+		metrics.Attr("cache_tier", ""),
+		metrics.Attr("content_type", resp.ContentType),
+	))
 }
 
 func cacheKey(r *http.Request) string {

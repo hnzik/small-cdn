@@ -1,9 +1,8 @@
 server:
   port: 8080
-  node_id: "node-1"
 
 origin:
-  url: "https://httpbin.org"
+  url: "https://ap-1f485fa7eb6f4fbc8396f49e5eaf20f7.ecs.eu-central-1.on.aws"
   timeout: 30s
   protection:
     single_flight:
@@ -16,7 +15,7 @@ origin:
 
 cache:
   memory:
-    max_size_mb: 256
+    max_size_mb: 2000
   disk:
     path: "./cache_data"
     max_size_mb: 2048

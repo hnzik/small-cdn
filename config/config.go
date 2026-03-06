@@ -94,6 +94,10 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
+	if v := os.Getenv("CDN_NODE_ID"); v != "" {
+		cfg.Server.NodeID = v
+	}
+
 	return cfg, nil
 }
 
@@ -107,13 +111,18 @@ func (c *Config) GetTTL(contentType string) time.Duration {
 }
 
 func matchPattern(pattern, contentType string) bool {
-	if pattern == contentType {
+	mediaType := contentType
+	if idx := strings.IndexByte(contentType, ';'); idx != -1 {
+		mediaType = strings.TrimSpace(contentType[:idx])
+	}
+
+	if pattern == mediaType {
 		return true
 	}
 	if strings.HasSuffix(pattern, "/*") {
 		prefix := strings.TrimSuffix(pattern, "/*")
-		return strings.HasPrefix(contentType, prefix+"/")
+		return strings.HasPrefix(mediaType, prefix+"/")
 	}
-	matched, _ := filepath.Match(pattern, contentType)
+	matched, _ := filepath.Match(pattern, mediaType)
 	return matched
 }
